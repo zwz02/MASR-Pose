@@ -1,0 +1,51 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.py~
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# PyTorch
+*.pth
+*.pt
+*.pkl
+
+# Training artifacts
+checkpoints/
+logs/
+log/
+runs/
+wandb/
+
+# Data (users prepare their own)
+data/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Environment
+.env
