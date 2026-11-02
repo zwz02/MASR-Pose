@@ -1,4 +1,4 @@
-# MASR-Pose: Explicit Geometry Enhancement via Manifold Aggregation and Structural Relation for Category-Level Object Pose Estimation
+# MASR-Pose: Explicit Geometry Enhancement via Manifold Aggregation and Structural Relation Modeling for Category-Level Object Pose Estimation
 
 Official implementation of **MASR-Pose**, a category-level 6D object pose estimation method that strengthens sparse keypoint representations with explicit geometric modeling at three complementary stages: feature fusion, local keypoint-neighbor aggregation, and global keypoint-relation modeling.
 

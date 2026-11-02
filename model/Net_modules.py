@@ -234,7 +234,7 @@ class GAFA_block(nn.Module):
         # 这样 MLP 拥有了判断平面、曲面、棱角的所有原始数据
         geo_input = torch.cat([delta_xyz, knn_normals, radial_alignment,
                                tangent_constraint  # 切向关系
-                               ], dim=-1)  # (B, Kpt, K, 7)
+                               ], dim=-1)  # (B, Kpt, K, 10)
 
         pos_enc_attn = self.fc_geo_attn(delta_xyz)  # (B, Kpt, K, C)
 
@@ -602,8 +602,8 @@ class PoseSizeEstimator(nn.Module):
 class StructuralRelationModule(nn.Module):
     def __init__(self, cfg):
         """
-        Structural Relation Module (SRM) - Corrected & Improved
-        Uses Competitive Soft-Switching to balance Semantic and Geometric cues.
+        Structural Relation Transformer (SRT)
+        Adds a gated per-head geometric bias to self-attention logits.
         """
         super().__init__()
         self.d_model = cfg.d_model
@@ -724,13 +724,9 @@ class StructuralRelationModule(nn.Module):
 
 class SGLR_Module(nn.Module):
     """
-    SGLR_v2: Non-Destructive Semantic-Guided Local Rectification
-
-    Improvements for Strict Metrics:
-    1. Tanh -> Sigmoid: Ensures feature magnitude is NEVER suppressed (Range 1.0 ~ 2.0).
-    2. Channel Split: Only modulates half of the geometry channels, keeping the other half
-       as pure, high-frequency geometry. This prevents DINO from over-smoothing points.
-    3. Zero-Init: Ensures smooth warmup.
+    Semantic-Guided Local Rectification (SGLR).
+    Splits the geometric channels, modulates one subset with RGB guidance,
+    and leaves the remaining channels unmodulated.
     """
 
     def __init__(self, rgb_dim=128, pts_dim=128, hidden_dim=64):
