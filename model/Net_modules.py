@@ -137,8 +137,7 @@ class GAFA_block(nn.Module):
         )
 
         self.fc_geo_value = nn.Sequential(
-            nn.Linear(10, 64), #nn.Linear(7, 64),
-            #nn.LayerNorm(64), #为了进一步保证 MLP 训练的稳定性，防止不同样本间尺度差异带来的影响
+            nn.Linear(10, 64),
             nn.ReLU(),
             nn.Linear(64, d_model),
             nn.ReLU(),
@@ -151,7 +150,7 @@ class GAFA_block(nn.Module):
             nn.Linear(d_model, d_model)
         )
 
-        # Value 融合层
+        # Value fusion.
         self.fc_value_fuse = nn.Sequential(
             nn.Linear(d_model * 2, d_model),
             nn.ReLU(),
@@ -210,83 +209,56 @@ class GAFA_block(nn.Module):
         Returns:
             kpt_feature: (b, kpt_num, 2c)
         """
-        # (b, kpt_num, 1, 3) - (b, 1, n, 3) = (b, kpt_num, n, 3)
+        # KNN neighbors for each keypoint.
         dis_mat = torch.norm(kpt_3d.unsqueeze(2) - pts.unsqueeze(1), dim=3)
         knn_idx = dis_mat.argsort()[:, :, :self.k]
         knn_xyz = index_points(pts, knn_idx)
         knn_feature = index_points(pts_feature, knn_idx)
+        knn_normals = index_points(normals.transpose(1, 2), knn_idx)
 
-        # 我们不需要计算 kpt_normal，避免了 heatmap 加权带来的错误
-        knn_normals = index_points(normals.transpose(1, 2), knn_idx)  # (B, Kpt, K, 3)
-
-        # 2. 构建流形感知的几何特征 (Manifold-Aware Geometric Features)
-        # A. 相对位置向量 (B, Kpt, K, 3)
-        #delta_xyz = knn_xyz - kpt_3d.unsqueeze(2)
+        # Explicit local geometry: relative offset, radial alignment,
+        # and tangential relation.
         SPATIAL_SCALE = 10.0
-        # A. 相对位置 (米 -> 分米)
         delta_xyz = (knn_xyz - kpt_3d.unsqueeze(2)) * SPATIAL_SCALE
-
-        # B. 径向对齐度 (Radial Alignment) (B, Kpt, K, 1)
         radial_alignment = torch.sum(delta_xyz * knn_normals, dim=-1, keepdim=True)
-        # 切向约束/叉积 , 作用：锁死位置和方向的相对关系，消除漂移，提升严格指标
         tangent_constraint = torch.cross(delta_xyz, knn_normals, dim=-1)
+        geo_input = torch.cat(
+            [delta_xyz, knn_normals, radial_alignment, tangent_constraint], dim=-1
+        )
 
-        # 这样 MLP 拥有了判断平面、曲面、棱角的所有原始数据
-        geo_input = torch.cat([delta_xyz, knn_normals, radial_alignment,
-                               tangent_constraint  # 切向关系
-                               ], dim=-1)  # (B, Kpt, K, 10)
+        # Key stream uses the offset; value stream uses the full descriptor.
+        pos_enc_attn = self.fc_geo_attn(delta_xyz)
+        pos_enc_value = self.fc_geo_value(geo_input)
 
-        pos_enc_attn = self.fc_geo_attn(delta_xyz)  # (B, Kpt, K, C)
-
-        # C. 显式编码
-        # MLP 会学习：什么样的 (delta, normal) 组合是有效的局部结构
-        #pos_enc = self.fc_geo(geo_input)  # (B, Kpt, K, d_model)
-        pos_enc_value = self.fc_geo_value(geo_input)  # (B, Kpt, K, C)
-
-        # (b, kpt_num, 2c)
         pre = kpt_feature
         kpt_query = self.fc_in(kpt_feature.transpose(1, 2))
-
-        # (b, kpt_num, 1, 3) - (b, kpt_num, k, 3) = (b, kpt_num, k, 3)
-        #pos_enc = kpt_3d.unsqueeze(2) - knn_xyz
-        #pos_enc = self.fc_delta(pos_enc)
-
-        # (b, kpt_num, k, 2c)
-        #knn_feature = self.fc_delta_1(torch.cat([knn_feature, pos_enc], dim=-1))
         knn_key = self.fc_key_fuse(torch.cat([knn_feature, pos_enc_attn], dim=-1))
         knn_value = self.fc_value_fuse(torch.cat([knn_feature, pos_enc_value], dim=-1))
 
-        #sim = F.cosine_similarity(kpt_feature.transpose(1, 2).unsqueeze(2).repeat(1, 1, self.k, 1), knn_feature, dim=-1)
         sim = F.cosine_similarity(
             kpt_query.transpose(1, 2).unsqueeze(2).repeat(1, 1, self.k, 1),
             knn_key,
             dim=-1
         )
-
         sim = F.softmax(sim / self.tau, dim=2)
-        # (b, kpt_num, 1, k) @ (b, kpt_num, k, 2c) -> (b, kpt_num, 1, 2c) -> (b, kpt_num, 2c)
+        # (b, kpt_num, 1, k) @ (b, kpt_num, k, 2c) -> (b, kpt_num, 2c)
         kpt_feature = torch.matmul(sim.unsqueeze(2), knn_value).squeeze(2)
         kpt_feature = F.relu(kpt_feature + pre)
 
-        # (b, kpt_num, 2c)
         pre = kpt_feature
         pos_enc_abs = self.fc_delta_abs(kpt_3d)
-
-        # (b, kpt_num, 1, 3) - (b, 1, kpt_num, 3) = (b, kpt_num, kpt_num, 3)
+        # Pairwise keypoint offsets.
         dis_mat_l = kpt_3d.unsqueeze(2) - kpt_3d.unsqueeze(1)
         pos_enc_abs_l = self.fc_delta_l(dis_mat_l)
         pos_enc_abs_l = torch.mean(pos_enc_abs_l, dim=2)
 
-        # (b, kpt_num, 2c)
         pos_enc_l = pos_enc_abs + pos_enc_abs_l
         kpt_num = kpt_3d.shape[1]
-        # (b, 1, 2c)
         kpt_global = torch.mean(kpt_feature, dim=1, keepdim=True)
-        # (b, 4c, kpt_num) -> (b, 2c, kpt_num)
+        # [F_kpt, global F_kpt, pairwise position encoding]
         kpt_feature = self.fuse_mlp(torch.cat(
             [kpt_feature.transpose(1, 2), kpt_global.transpose(1, 2).repeat(1, 1, kpt_num), pos_enc_l.transpose(1, 2)],
             dim=1))
-        # (b, kpt_num, 2c)
         kpt_feature = F.relu(kpt_feature.transpose(1, 2) + pre)
         pre = kpt_feature
         kpt_feature = self.out_mlp(kpt_feature)
@@ -514,9 +486,7 @@ class InstanceAdaptiveKeypointDetector(nn.Module):
             pts_local (_type_): (b, c, n)
             cls:                (b, )
         """
-        b, c, n = input_feature.shape #b, c, n = rgb_local.shape
-
-        #input_feature = torch.cat((pts_local, rgb_local), dim=1)  # (b, 2c, n)
+        b, c, n = input_feature.shape
 
         batch_kpt_query = self.kpt_query.unsqueeze(0).repeat(b, 1, 1)
         # (b, kpt_num, 2c)  (b, kpt_num, n)
@@ -613,12 +583,11 @@ class StructuralRelationModule(nn.Module):
         assert self.d_model % self.num_head == 0
         self.head_dim = self.d_model // self.num_head
 
-        # [Fix 1]: 使用 Linear 替代 Conv1d，适应 (B, N, C) 的 Transformer 标准输入
         self.q_proj = nn.Linear(self.d_model, self.d_model)
         self.k_proj = nn.Linear(self.d_model, self.d_model)
         self.v_proj = nn.Linear(self.d_model, self.d_model)
 
-        # 2. Geometric Structure Encoder
+        # Pairwise offset -> one bias per attention head.
         self.geo_encoder = nn.Sequential(
             nn.Linear(3, 64),
             nn.ReLU(),
@@ -627,20 +596,13 @@ class StructuralRelationModule(nn.Module):
             nn.Linear(64, self.num_head)
         )
 
-        # [Improvement 1]: Learnable scaling factor for geometry
-        # 几何偏置的数值范围可能与点积注意力(缩放后)不一致，加一个可学习标量自动平衡
-        #self.geo_scale = nn.Parameter(torch.ones(1) * 0.01)
-
-        # 3. Gate Predictor
+        # Feature -> one gate per query and head.
         self.gate_predictor = nn.Sequential(
             nn.Linear(self.d_model, 64),
             nn.ReLU(),
             nn.Linear(64, self.num_head),
-            #nn.Sigmoid()  # Range [0, 1]
         )
 
-
-        # Output Projection
         self.out_proj = nn.Linear(self.d_model, self.d_model)
 
         self.norm1 = nn.LayerNorm(self.d_model)
@@ -657,13 +619,9 @@ class StructuralRelationModule(nn.Module):
         self._reset_parameters()
 
     def _reset_parameters(self):
-        # 1. Gate 初始化为极小值
-        # 使得初始状态下 Attn = Semantic + 0，完全等同于普通 Attention
+        # Start from plain self-attention: zero gate contribution and zero output.
         nn.init.constant_(self.gate_predictor[-1].weight, 0.0)
-        nn.init.constant_(self.gate_predictor[-1].bias, -4.0) # Sigmoid(-4) is small
-
-        # 2. Output Zero-Init
-        # 使得初始状态下 SRM(x) = 0, Output = x + 0
+        nn.init.constant_(self.gate_predictor[-1].bias, -4.0)
         nn.init.constant_(self.out_proj.weight, 0.0)
         nn.init.constant_(self.out_proj.bias, 0.0)
 
@@ -679,19 +637,13 @@ class StructuralRelationModule(nn.Module):
         b, n, c = x.shape
         residual = x
 
-        # --- Step 1: Geometric Bias ---
-        # (B, N, N, 3)
+        # Pairwise offsets; detached so the bias does not back-propagate to coordinates.
         relative_pos = kpt_3d.detach().unsqueeze(2) - kpt_3d.detach().unsqueeze(1)
-        # (B, H, N, N)
         geo_bias = self.geo_encoder(relative_pos).permute(0, 3, 1, 2)
 
-        # --- Step 2: Additive Gate ---
-        # 计算“我们需要多大程度的几何约束？”
-        # 使用 Sigmoid 确保系数平滑，且初始化为 0
-        # (B, N, C) -> (B, N, H) -> (B, H, N, 1)
+        # Gate per query and head.
         gate = torch.sigmoid(self.gate_predictor(x)).permute(0, 2, 1).unsqueeze(-1)
 
-        # --- Step 3: Attention Calculation ---
         query = self.q_proj(x).view(b, n, self.num_head, self.head_dim).transpose(1, 2)
         key = self.k_proj(x).view(b, n, self.num_head, self.head_dim).transpose(1, 2)
         value = self.v_proj(x).view(b, n, self.num_head, self.head_dim).transpose(1, 2)
@@ -699,10 +651,7 @@ class StructuralRelationModule(nn.Module):
         scale = self.head_dim ** -0.5
         semantic_logits = torch.matmul(query, key.transpose(-2, -1)) * scale
 
-        # [核心哲学修正]:
-        # 不再是 (1-g)*Sem + g*Geo
-        # 而是 Sem + g*Geo
-        # 语义特征永远保持原样，几何特征作为 Bias 叠加
+        # Feature logits + gated geometric bias.
         attn_logits = semantic_logits + gate * geo_bias
 
         attn_weights = F.softmax(attn_logits, dim=-1)
@@ -710,15 +659,12 @@ class StructuralRelationModule(nn.Module):
 
         out = torch.matmul(attn_weights, value)
         out = out.transpose(1, 2).contiguous().view(b, n, c)
-
-        # Zero-Init 保证这里初始输出为 0
         out = self.out_proj(out)
 
-        # Residual + Norm
+        # Two residual updates with LayerNorm.
         x = self.norm1(out + residual)
         x = self.norm2(x + self.ffn(x))
 
-        # 转回 (B, C, N)
         return x.permute(0, 2, 1).contiguous()
 
 
@@ -733,24 +679,23 @@ class SGLR_Module(nn.Module):
         super().__init__()
 
         self.pts_dim = pts_dim
-        # 我们只对一半的几何通道进行语义增强，另一半保持原样作为“高频几何锚点”
+        # Modulate one half; keep the other half unchanged.
         self.modulate_dim = pts_dim // 2
         self.keep_dim = pts_dim - self.modulate_dim
 
-        # 语义引导生成器
+        # RGB feature -> one coefficient per modulated channel.
         self.guidance_mlp = nn.Sequential(
             nn.Conv1d(rgb_dim, hidden_dim, 1),
             nn.BatchNorm1d(hidden_dim),
             nn.ReLU(),
-            nn.Dropout(p=0.05),  # 保持轻微正则化
-            nn.Conv1d(hidden_dim, self.modulate_dim, 1),  # 只输出一半通道的系数
-            nn.Sigmoid()  # <--- 关键修改：改为 Sigmoid，范围 (0, 1)
+            nn.Dropout(p=0.05),
+            nn.Conv1d(hidden_dim, self.modulate_dim, 1),
+            nn.Sigmoid()
         )
 
         self._init_weights()
 
     def _init_weights(self):
-        # 零初始化
         for m in self.guidance_mlp.modules():
             if isinstance(m, nn.Conv1d):
                 nn.init.zeros_(m.weight)
@@ -763,30 +708,12 @@ class SGLR_Module(nn.Module):
             rgb_feat: (B, C, N)
             pts_feat: (B, C, N)
         """
-        # 1. 通道分离 (Split)
-        # pts_keep: 保持纯粹几何，不被 RGB 干扰，负责高精度几何细节
-        # pts_mod:  接受语义增强，负责类别级姿态的鲁棒性
         pts_mod, pts_keep = torch.split(pts_feat, [self.modulate_dim, self.keep_dim], dim=1)
+        guidance = self.guidance_mlp(rgb_feat)
 
-        # 2. 生成非破坏性系数 (Non-destructive Factors)
-        # Sigmoid 输出 0~1。 scale_factor 物理意义是 "Enhancement Ratio"
-        # 初始状态下由于 Zero-Init，Sigmoid(0)=0.5。
-        # 为了让初始状态完全 Identity，我们可以做一点 shift，但 Sigmoid(0)=0.5 其实是均匀增强，问题不大。
-        # 或者更稳妥：让 MLP 输出直接作为 residual，不用 1+。
-        # 让我们坚持 "Scale" 逻辑，但修正范围。
-
-        guidance = self.guidance_mlp(rgb_feat)  # (B, C/2, N), range (0, 1)
-
-        # 3. 语义增强 (Rectification)
-        # 公式：F_new = F_old * (1 + Guidance)
-        # 范围：F_old * [1.0, 2.0]
-        # 绝对不抑制！
+        # 1 + guidance keeps the modulated amplitude in [1, 2] x the original.
         pts_mod_rectified = pts_mod * (1.0 + guidance)
-
-        # 4. 通道重组 (Re-assemble)
         pts_final = torch.cat([pts_mod_rectified, pts_keep], dim=1)
-
-        # 5. 与 RGB 拼接输出
         out = torch.cat([pts_final, rgb_feat], dim=1)
 
         return out

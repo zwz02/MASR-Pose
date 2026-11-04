@@ -93,27 +93,15 @@ class Net(nn.Module):
             delta_r, delta_t, delta_s, outliers = generate_augmentation(b)
             pts = (pts - delta_t) / delta_s.unsqueeze(2) @ delta_r
 
-            #num_outliers = outliers.shape[1]
-            #idx = torch.randperm(pts.shape[1])[:num_outliers]
-
-            #pts[:, idx, :] = outliers
-
         pts_local = self.pts_extractor(pts)  # b, c, n
 
-        # 预测法线
         pred_normals_raw = self.normal_predictor(pts_local)  # (B, 3, N)
-        # L2归一化，确保预测的法线是单位向量
         pred_normals = F.normalize(pred_normals_raw, p=2, dim=1)
-        # 转置以匹配 (B, N, 3) 的格式，方便计算loss
         end_points['pred_normals'] = pred_normals.transpose(1, 2)
 
-        #cat_features = torch.cat((pts_local, rgb_local), dim=1)  # (B, 256, N)
-        #fused_features = self.fusion_module(cat_features)
-
         fused_features = self.fusion_module(rgb_local, pts_local)
-        #fused_features = torch.cat((pts_local, rgb_local), dim=1)
 
-        batch_kpt_query, heat_map = self.IAKD(fused_features)  #self.IAKD(rgb_local, pts_local)
+        batch_kpt_query, heat_map = self.IAKD(fused_features)
         kpt_3d = torch.bmm(heat_map, pts)
 
         kpt_feature = torch.bmm(heat_map, fused_features.transpose(1, 2))
